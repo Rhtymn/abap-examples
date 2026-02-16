@@ -222,7 +222,7 @@ FORM f_single_proc
   CLEAR lx_anchor.
 
   GET TIME STAMP FIELD ld_end_time.
-  x_proc_info-start_time = ld_end_time.
+  x_proc_info-end_time = ld_end_time.
   x_proc_info-duration = ld_end_time - ld_start_time.
   x_proc_info-processing_type = c_proctype-single.
 ENDFORM.
@@ -280,7 +280,7 @@ FORM f_parallel_proc
   ENDIF.
 
   GET TIME STAMP FIELD ld_end_time.
-  x_proc_info-start_time = ld_end_time.
+  x_proc_info-end_time = ld_end_time.
   x_proc_info-duration = ld_end_time - ld_start_time.
   x_proc_info-processing_type = c_proctype-parallel.
 ENDFORM.
