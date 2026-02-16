@@ -1,0 +1,516 @@
+*&---------------------------------------------------------------------*
+*& Report ZMHRAB_E00002
+*&---------------------------------------------------------------------*
+*&
+*&---------------------------------------------------------------------*
+REPORT zmhrab_e00002.
+
+*&---------------------------------------------------------------------*
+*& TABLES
+*&---------------------------------------------------------------------*
+TABLES: vbak, rzllitab.
+
+*&---------------------------------------------------------------------*
+*& CONSTANTS
+*&---------------------------------------------------------------------*
+CONSTANTS: BEGIN OF c_proctype,
+             parallel TYPE string VALUE 'Parallel Processing',
+             single   TYPE string VALUE 'Single Processing',
+           END OF c_proctype.
+
+*&---------------------------------------------------------------------*
+*& TYPES
+*&---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_anchor,
+         kunnr TYPE vbak-kunnr,
+         vkorg TYPE vbak-vkorg,
+       END OF ty_anchor,
+       BEGIN OF ty_proc_information,
+         num_of_data_proc TYPE i,
+         start_time       TYPE timestampl,
+         end_time         TYPE timestampl,
+         duration         TYPE p DECIMALS 3,
+         processing_type  TYPE string,
+       END OF ty_proc_information,
+       ty_t_anchor TYPE TABLE OF ty_anchor,
+       BEGIN OF ty_task,
+         kunnr TYPE vbak-kunnr,
+         vkorg TYPE vbak-vkorg,
+       END OF ty_task,
+       BEGIN OF ty_result,
+         sales_orders TYPE TABLE OF bapiorders WITH DEFAULT KEY,
+       END OF ty_result.
+
+*&---------------------------------------------------------------------*
+*& Global Variables
+*&---------------------------------------------------------------------*
+DATA: d_error     TYPE abap_bool,
+      d_errmsg    TYPE string,
+      d_errtype   TYPE char1,
+      x_proc_info TYPE ty_proc_information,
+      t_report    TYPE TABLE OF bapiorders,
+      t_tasks     TYPE ty_t_anchor.
+
+*&---------------------------------------------------------------------*
+*& SELECTIONS SCREEN
+*&---------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001.
+  PARAMETERS: p_isprl  AS CHECKBOX USER-COMMAND uc1,
+              p_numprc TYPE i MODIF ID m1 DEFAULT 2,
+              p_srvgrp TYPE rzllitab-classname DEFAULT 'parallel_generators' MODIF ID m1.
+SELECTION-SCREEN END OF BLOCK b1.
+
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE TEXT-002.
+  SELECT-OPTIONS: s_kunnr FOR vbak-kunnr NO INTERVALS MODIF ID m2,
+                  s_vkorg FOR vbak-vkorg NO INTERVALS MODIF ID m2.
+SELECTION-SCREEN END OF BLOCK b2.
+
+*&---------------------------------------------------------------------*
+*& MACROS
+*&---------------------------------------------------------------------*
+DEFINE m_return_iferror.
+  IF &1 EQ abap_true.
+    RETURN.
+  ELSE.
+    " do nothing
+  ENDIF.
+END-OF-DEFINITION.
+
+DEFINE m_set_error.
+  &1 = abap_true.
+  &2 = &3.
+  &4 = &5.
+END-OF-DEFINITION.
+
+DEFINE m_check_emptyness.
+  IF &1 IS INITIAL.
+    m_set_error &2 &5 'E' &3 &4.
+  ELSE.
+    " do nothing
+  ENDIF.
+END-OF-DEFINITION.
+
+DEFINE m_disp_msg_iferror.
+  IF &1 EQ abap_true.
+    MESSAGE &2 TYPE 'S' DISPLAY LIKE &3.
+    RETURN.
+  ELSE.
+    " do nothing
+  ENDIF.
+END-OF-DEFINITION.
+
+*&---------------------------------------------------------------------*
+*& SUBROUTINES
+*&---------------------------------------------------------------------*
+FORM f_init.
+  CLEAR: d_errmsg, d_error, d_errtype, x_proc_info, t_report[], t_tasks[].
+ENDFORM.
+
+FORM f_modify_screen.
+  LOOP AT SCREEN.
+    CASE screen-group1.
+      WHEN 'M1'.
+        screen-required = 2.
+        screen-active = COND #( WHEN p_isprl IS INITIAL THEN 0 ELSE 1 ).
+      WHEN 'M2'.
+        screen-required = 2.
+    ENDCASE.
+    MODIFY SCREEN.
+  ENDLOOP.
+ENDFORM.
+
+FORM f_validate_selscreen
+  CHANGING fc_d_err TYPE abap_bool
+           fc_d_errtype TYPE char1
+           fc_d_errmsg TYPE string.
+
+  m_check_emptyness p_srvgrp fc_d_err fc_d_errmsg 'Server Group Mandatory' fc_d_errtype.
+  m_return_iferror fc_d_err.
+
+  m_check_emptyness s_kunnr[] fc_d_err fc_d_errmsg 'Customer Number Mandatory' fc_d_errtype.
+  m_return_iferror fc_d_err.
+
+  m_check_emptyness s_vkorg[] fc_d_err fc_d_errmsg 'Sales Organization Mandatory' fc_d_errtype.
+  m_return_iferror fc_d_err.
+ENDFORM.
+
+FORM f_restrict_s_kunnr.
+  DATA: lx_restrict TYPE sscr_restrict,
+        lx_opt      TYPE sscr_opt_list,
+        lx_ass      TYPE sscr_ass.
+  CLEAR: lx_opt, lx_ass, lx_restrict.
+
+  " Define restriction: only EQ (equals) allowed
+  lx_opt-name       = 'OBJECTKEY'.
+  lx_opt-options-eq = 'X'.  " Allow Equal
+  APPEND lx_opt TO lx_restrict-opt_list_tab.
+
+  " Assign restriction to field
+  lx_ass-kind    = 'S'.           " Select-option
+  lx_ass-name    = 'S_KUNNR'.     " Field name
+  lx_ass-sg_main = 'I'.           " Include
+  lx_ass-sg_addy = space.
+  lx_ass-op_main = 'OBJECTKEY'.   " Reference restriction
+  APPEND lx_ass TO lx_restrict-ass_tab.
+
+  " Apply restriction
+  CALL FUNCTION 'SELECT_OPTIONS_RESTRICT'
+    EXPORTING
+      restriction            = lx_restrict
+    EXCEPTIONS
+      too_late               = 1
+      repeated               = 2
+      selopt_without_options = 3
+      selopt_without_signs   = 4
+      invalid_sign           = 5
+      empty_option_list      = 6
+      invalid_kind           = 7
+      repeated_kind_a        = 8
+      OTHERS                 = 9.
+
+  IF sy-subrc EQ 0.
+    " do nothing
+  ENDIF.
+ENDFORM.
+
+FORM f_single_proc
+  CHANGING fc_d_err TYPE abap_bool
+           fc_d_errtype TYPE char1
+           fc_d_errmsg TYPE string.
+
+  DATA: lt_anchor      TYPE ty_t_anchor,
+        lx_anchor      LIKE LINE OF lt_anchor,
+        lt_salesorders TYPE TABLE OF bapiorders,
+        ld_start_time  TYPE timestampl,
+        ld_end_time    TYPE timestampl.
+  CLEAR: fc_d_err, fc_d_errtype, fc_d_errmsg, lx_anchor, lt_anchor, lt_salesorders[],
+         ld_start_time, ld_end_time.
+
+  PERFORM f_get_anchor CHANGING lt_anchor.
+  IF lt_anchor IS INITIAL.
+    m_set_error d_error d_errtype 'W' d_errmsg 'No data found.'.
+    RETURN.
+  ELSE.
+    " do nothing
+  ENDIF.
+
+  GET TIME STAMP FIELD ld_start_time.
+  x_proc_info-num_of_data_proc = lines( lt_anchor ).
+  x_proc_info-start_time = ld_start_time.
+
+  LOOP AT lt_anchor INTO lx_anchor.
+    CLEAR: lt_salesorders[].
+
+    CALL FUNCTION 'BAPI_SALESORDER_GETLIST'
+      EXPORTING
+        customer_number    = lx_anchor-kunnr
+        sales_organization = lx_anchor-vkorg
+      TABLES
+        sales_orders       = lt_salesorders.
+
+    IF lt_salesorders[] IS NOT INITIAL.
+      LOOP AT lt_salesorders INTO DATA(lx_sales_order).
+        APPEND lx_sales_order TO t_report.
+      ENDLOOP.
+      CLEAR: lx_sales_order.
+    ELSE.
+      " do nothing
+    ENDIF.
+
+*    WAIT UP TO 1 SECONDS.
+  ENDLOOP.
+  CLEAR lx_anchor.
+
+  GET TIME STAMP FIELD ld_end_time.
+  x_proc_info-start_time = ld_end_time.
+  x_proc_info-duration = ld_end_time - ld_start_time.
+  x_proc_info-processing_type = c_proctype-single.
+ENDFORM.
+
+FORM f_parallel_proc
+  CHANGING fc_d_err TYPE abap_bool
+           fc_d_errtype TYPE char1
+           fc_d_errmsg TYPE string.
+
+  DATA: lt_anchor      TYPE ty_t_anchor,
+        lx_anchor      LIKE LINE OF lt_anchor,
+        lt_salesorders TYPE TABLE OF bapiorders,
+        ld_start_time  TYPE timestampl,
+        ld_end_time    TYPE timestampl,
+        ld_errmsg      TYPE string.
+  CLEAR: fc_d_err, fc_d_errtype, fc_d_errmsg, lx_anchor, lt_anchor, lt_salesorders[],
+         ld_start_time, ld_end_time, ld_errmsg.
+
+  PERFORM f_get_anchor CHANGING lt_anchor.
+  IF lt_anchor IS INITIAL.
+    m_set_error fc_d_err fc_d_errtype 'W' fc_d_errmsg 'No data found.'.
+    RETURN.
+  ELSE.
+    " do nothing
+  ENDIF.
+
+  GET TIME STAMP FIELD ld_start_time.
+  x_proc_info-num_of_data_proc = lines( lt_anchor ).
+  x_proc_info-start_time = ld_start_time.
+  t_tasks[] = lt_anchor[].
+
+  CALL FUNCTION 'SPTA_PARA_PROCESS_START_2'
+    EXPORTING
+      server_group             = p_srvgrp
+      max_no_of_tasks          = p_numprc
+      before_rfc_callback_form = 'F_BEFORE_PROC'
+      in_rfc_callback_form     = 'F_IN'
+      after_rfc_callback_form  = 'F_AFTER'
+      callback_prog            = sy-repid
+    EXCEPTIONS
+      invalid_server_group     = 1
+      no_resources_available   = 2
+      OTHERS                   = 3.
+  IF sy-subrc <> 0.
+    CASE sy-subrc.
+      WHEN 1.
+        ld_errmsg = 'Invalid server group'.
+      WHEN 2.
+        ld_errmsg = 'No resources available'.
+      WHEN OTHERS.
+        ld_errmsg = 'Failed start parallel processing.'.
+    ENDCASE.
+    m_set_error fc_d_err fc_d_errtype 'E' fc_d_errmsg ld_errmsg.
+    RETURN.
+  ENDIF.
+
+  GET TIME STAMP FIELD ld_end_time.
+  x_proc_info-start_time = ld_end_time.
+  x_proc_info-duration = ld_end_time - ld_start_time.
+  x_proc_info-processing_type = c_proctype-parallel.
+ENDFORM.
+
+FORM f_before_proc
+        USING p_before_rfc_imp  TYPE spta_t_before_rfc_imp
+       	CHANGING p_before_rfc_exp  TYPE spta_t_before_rfc_exp
+                      p_rfcdata         TYPE spta_t_indxtab
+                      p_failed_objects  TYPE spta_t_failed_objects
+                      p_pending_objects TYPE spta_t_pending_objects
+                      p_user_param.
+
+  DATA: lx_task TYPE ty_task.
+  CLEAR: lx_task.
+
+  IF t_tasks[] IS INITIAL.
+    CLEAR p_before_rfc_exp-start_rfc.
+    EXIT.
+  ELSE.
+    " do nothing
+  ENDIF.
+
+  READ TABLE t_tasks INDEX 1 INTO lx_task.
+  IF sy-subrc NE 0 OR lx_task IS INITIAL.
+    DELETE t_tasks INDEX 1.
+    RETURN.
+  ELSE.
+    " do nothing
+  ENDIF.
+  DELETE t_tasks INDEX 1.
+
+  p_before_rfc_exp-start_rfc = 'X'.
+  CALL FUNCTION 'SPTA_INDX_PACKAGE_ENCODE'
+    EXPORTING
+      data    = lx_task
+    IMPORTING
+      indxtab = p_rfcdata.
+ENDFORM.
+
+FORM f_in
+  USING p_in_rfc_imp TYPE spta_t_in_rfc_imp
+  CHANGING p_in_rfc_exp TYPE spta_t_in_rfc_exp
+                  p_rfcdata TYPE spta_t_indxtab.
+
+  DATA: lx_task        TYPE ty_task,
+        lt_salesorders TYPE TABLE OF bapiorders,
+        lx_result      TYPE ty_result.
+  CLEAR: lx_task, lt_salesorders[], lx_result.
+
+  CALL FUNCTION 'SPTA_INDX_PACKAGE_DECODE'
+    EXPORTING
+      indxtab = p_rfcdata
+    IMPORTING
+      data    = lx_task.
+
+  CALL FUNCTION 'BAPI_SALESORDER_GETLIST'
+    EXPORTING
+      customer_number    = lx_task-kunnr
+      sales_organization = lx_task-vkorg
+    TABLES
+      sales_orders       = lt_salesorders.
+
+  lx_result-sales_orders = lt_salesorders[].
+  CALL FUNCTION 'SPTA_INDX_PACKAGE_ENCODE'
+    EXPORTING
+      data    = lx_result
+    IMPORTING
+      indxtab = p_rfcdata.
+ENDFORM.
+
+FORM f_after USING p_rfcdata TYPE spta_t_indxtab
+                     p_rfcsubre        TYPE sy-subrc
+                     p_rfcmsg          TYPE spta_t_rfcmsg
+                     p_pending_objects TYPE spta_t_pending_objects
+                     p_after_rfc_imp   TYPE spta_t_after_rfc_imp
+            CHANGING p_after_rfc_exp   TYPE spta_t_after_rfc_exp
+                     p_user_param.
+
+  DATA: lx_result TYPE ty_result.
+  CLEAR: lx_result.
+
+  CALL FUNCTION 'SPTA_INDX_PACKAGE_DECODE'
+    EXPORTING
+      indxtab = p_rfcdata
+    IMPORTING
+      data    = lx_result.
+
+  IF lx_result-sales_orders[] IS NOT INITIAL.
+    LOOP AT lx_result-sales_orders INTO DATA(lx_sales_order).
+      APPEND lx_sales_order TO t_report.
+    ENDLOOP.
+    CLEAR lx_sales_order.
+  ELSE.
+    " do nothing
+  ENDIF.
+ENDFORM.
+
+FORM f_display_alv
+  CHANGING fc_d_err     TYPE abap_bool
+           fc_d_errtype TYPE char1
+           fc_d_errmsg  TYPE string.
+
+  DATA: lo_alv    TYPE REF TO cl_salv_table,
+        lo_header TYPE REF TO cl_salv_form_layout_grid,
+        lo_label  TYPE REF TO cl_salv_form_label,
+        lo_text   TYPE REF TO cl_salv_form_text,
+        lx_msg    TYPE REF TO cx_salv_msg,
+        ld_msg    TYPE string.
+
+  CLEAR: fc_d_err, fc_d_errtype, fc_d_errmsg, ld_msg.
+
+  " Validate data exists
+  IF t_report IS INITIAL.
+    m_set_error fc_d_err fc_d_errtype 'W' fc_d_errmsg 'No data to display.'.
+    RETURN.
+  ENDIF.
+
+  SORT t_report BY sd_doc.
+
+  TRY.
+      " Create ALV instance
+      cl_salv_table=>factory(
+        IMPORTING r_salv_table = lo_alv
+        CHANGING  t_table      = t_report ).
+
+      " Enable standard ALV functions
+      lo_alv->get_functions( )->set_all( abap_true ).
+
+      " Display settings
+      lo_alv->get_display_settings( )->set_striped_pattern( abap_true ).
+
+      " Auto-optimize columns
+      lo_alv->get_columns( )->set_optimize( abap_true ).
+
+      " ========== Build Top of Page Header ==========
+      lo_header = NEW cl_salv_form_layout_grid( ).
+
+      " Title (Row 1)
+      lo_label = lo_header->create_label( row = 1 column = 1 ).
+      lo_label->set_text( 'Sales Order Processing Report' ).
+
+      " Processing Type (Row 2)
+      lo_text = lo_header->create_text(
+        row    = 2
+        column = 1
+        text   = |Processing Type: { x_proc_info-processing_type }| ).
+
+      " Duration (Row 3)
+      lo_text = lo_header->create_text(
+        row    = 3
+        column = 1
+        text   = |Duration: { x_proc_info-duration DECIMALS = 3 } seconds| ).
+
+      " Customer-SalesOrg Pairs (Row 4)
+      lo_text = lo_header->create_text(
+        row    = 4
+        column = 1
+        text   = |Customer-SalesOrg Pairs Processed: { x_proc_info-num_of_data_proc }| ).
+
+      " Total Orders (Row 5)
+      lo_text = lo_header->create_text(
+        row    = 5
+        column = 1
+        text   = |Total Orders Found: { lines( t_report ) }| ).
+
+      " Parallel Tasks (Row 6) - conditional
+      IF x_proc_info-processing_type EQ c_proctype-parallel.
+        lo_text = lo_header->create_text(
+          row    = 6
+          column = 1
+          text   = |Parallel Tasks Used: { p_numprc }| ).
+      ENDIF.
+
+      " Set top of list
+      lo_alv->set_top_of_list( lo_header ).
+      " ==============================================
+
+      " Display ALV
+      lo_alv->display( ).
+
+    CATCH cx_salv_msg INTO lx_msg.
+      ld_msg = lx_msg->get_text( ).
+      m_set_error fc_d_err fc_d_errtype 'E' fc_d_errmsg ld_msg.
+  ENDTRY.
+
+ENDFORM.
+
+FORM f_get_anchor
+  CHANGING fc_t_anchor TYPE ty_t_anchor.
+
+  SELECT kunnr, vkorg
+    FROM vbak
+      WHERE kunnr IN @s_kunnr
+        AND vkorg IN @s_vkorg
+    INTO TABLE @fc_t_anchor.
+
+  IF sy-subrc EQ 0 AND fc_t_anchor[] IS NOT INITIAL.
+    SORT fc_t_anchor BY kunnr vkorg.
+    DELETE ADJACENT DUPLICATES FROM fc_t_anchor COMPARING ALL FIELDS.
+  ELSE.
+    " do nothing
+  ENDIF.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& PBO
+*&---------------------------------------------------------------------*
+AT SELECTION-SCREEN OUTPUT.
+  PERFORM f_modify_screen.
+  PERFORM f_restrict_s_kunnr.
+
+*&---------------------------------------------------------------------*
+*& START OF SELECTIONS
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+  PERFORM f_init.
+
+  PERFORM f_validate_selscreen CHANGING d_error d_errtype d_errmsg.
+  m_disp_msg_iferror d_error d_errmsg d_errtype.
+
+  CASE p_isprl.
+    WHEN abap_true.
+      PERFORM f_parallel_proc CHANGING d_error d_errtype d_errmsg.
+      m_disp_msg_iferror d_error d_errmsg d_errtype.
+
+    WHEN OTHERS.
+      PERFORM f_single_proc CHANGING d_error d_errtype d_errmsg.
+      m_disp_msg_iferror d_error d_errmsg d_errtype.
+
+  ENDCASE.
+
+  PERFORM f_display_alv CHANGING d_error d_errtype d_errmsg.
+  m_disp_msg_iferror d_error d_errmsg d_errtype.
